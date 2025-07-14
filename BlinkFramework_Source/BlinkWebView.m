@@ -6,16 +6,20 @@
 #import "BlinkWebView.h"
 #import "BlinkRenderingEngine.h"
 #import "BlinkJSEngine.h"
+#import <WebKit/WebKit.h>
 
 @implementation BlinkWebView
 
 - (instancetype)initWithFrame:(CGRect)frame {
-    WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-    config.allowsInlineMediaPlayback = YES;
-    config.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
-    
-    self = [super initWithFrame:frame configuration:config];
+    self = [super initWithFrame:frame];
     if (self) {
+        WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+        config.allowsInlineMediaPlayback = YES;
+        
+        self.webView = [[WKWebView alloc] initWithFrame:self.bounds configuration:config];
+        self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self addSubview:self.webView];
+        
         self.userAgent = @"BlinkWebView/1.0 (Blink Rendering Engine)";
         self.enableJavaScript = YES;
         self.enableDOMStorage = YES;
@@ -24,17 +28,21 @@
     return self;
 }
 
-- (void)enableBlinkFeatures {
-    // Initialize Blink rendering engine
-    [[BlinkRenderingEngine sharedEngine] initializeRenderer];
-    [[BlinkJSEngine sharedEngine] initializeV8Engine];
-    
-    // Set custom user agent
-    [self setCustomUserAgent:self.userAgent];
+- (void)loadHTMLString:(NSString *)string baseURL:(NSURL *)baseURL {
+    [self.webView loadHTMLString:string baseURL:baseURL];
 }
 
-- (void)setCustomUserAgent:(NSString *)userAgent {
-    [self setValue:userAgent forKey:@"customUserAgent"];
+- (void)loadRequest:(NSURLRequest *)request {
+    [self.webView loadRequest:request];
+}
+
+- (void)evaluateJavaScript:(NSString *)javaScriptString completionHandler:(void (^)(id, NSError *))completionHandler {
+    [self.webView evaluateJavaScript:javaScriptString completionHandler:completionHandler];
+}
+
+- (void)enableBlinkFeatures {
+    [[BlinkRenderingEngine sharedEngine] initializeRenderer];
+    [[BlinkJSEngine sharedEngine] initializeV8Engine];
 }
 
 - (void)setBlinkRenderingMode:(NSString *)mode {
