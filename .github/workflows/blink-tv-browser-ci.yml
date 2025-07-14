@@ -1,0 +1,566 @@
+name: Blink TV Browser CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'BlinkFramework_Source/**'
+      - 'BlinkTVBrowser/**'
+      - 'BlinkFramework.framework/**'
+      - '*.xcodeproj/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'BlinkFramework_Source/**'
+      - 'BlinkTVBrowser/**'
+      - 'BlinkFramework.framework/**'
+      - '*.xcodeproj/**'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      run_tests:
+        description: 'Run tests'
+        required: true
+        default: true
+        type: boolean
+      deploy:
+        description: 'Deploy to TestFlight'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  XCODE_VERSION: '15.0'
+  TVOS_DEPLOYMENT_TARGET: '17.0'
+  PROJECT_NAME: 'BlinkTVBrowser'
+  FRAMEWORK_NAME: 'BlinkFramework'
+  BUNDLE_ID: 'com.blink.tvbrowser'
+
+jobs:
+  # Job 1: Build and Test Framework
+  build-framework:
+    name: 🔧 Build Blink Framework
+    runs-on: [self-hosted, macOS, launchfor]
+    timeout-minutes: 30
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        lfs: true
+    
+    - name: 🔍 Setup Environment
+      run: |
+        echo "🏗️ Setting up build environment"
+        echo "XCODE_PATH=$(xcode-select -p)" >> $GITHUB_ENV
+        echo "MACOS_VERSION=$(sw_vers -productVersion)" >> $GITHUB_ENV
+        echo "XCODE_VERSION=$(xcodebuild -version | head -1 | cut -d' ' -f2)" >> $GITHUB_ENV
+        
+        # Verify Xcode installation
+        xcodebuild -version
+        xcrun --sdk appletvos --show-sdk-version
+        xcrun --sdk appletvsimulator --show-sdk-version
+    
+    - name: 📋 Environment Info
+      run: |
+        echo "🖥️ Build Environment:"
+        echo "  • macOS: $MACOS_VERSION"
+        echo "  • Xcode: $XCODE_VERSION"
+        echo "  • Xcode Path: $XCODE_PATH"
+        echo "  • Working Directory: $(pwd)"
+        echo "  • Available SDKs:"
+        xcodebuild -showsdks | grep tvos
+        
+        echo "📁 Project Structure:"
+        ls -la
+        
+        echo "🔧 Framework Source:"
+        ls -la BlinkFramework_Source/ || echo "Framework source not found"
+    
+    - name: 🧹 Clean Previous Builds
+      run: |
+        echo "🧹 Cleaning previous builds..."
+        
+        # Clean framework build artifacts
+        cd BlinkFramework_Source
+        rm -f *.o *.a
+        cd ..
+        
+        # Clean Xcode build cache
+        rm -rf ~/Library/Developer/Xcode/DerivedData/$PROJECT_NAME-*
+        
+        # Clean project build directory
+        if [ -d "build" ]; then
+          rm -rf build
+        fi
+    
+    - name: 🔨 Compile Blink Framework
+      run: |
+        echo "🔨 Compiling Blink Framework..."
+        cd BlinkFramework_Source
+        
+        # Set build configuration
+        BUILD_CONFIG="${{ github.event.inputs.build_type || 'debug' }}"
+        echo "Build Configuration: $BUILD_CONFIG"
+        
+        # Compile for tvOS Device (ARM64)
+        echo "📱 Compiling for tvOS Device (ARM64)..."
+        clang -c -fobjc-arc -target arm64-apple-tvos$TVOS_DEPLOYMENT_TARGET \
+          -isysroot $(xcrun --sdk appletvos --show-sdk-path) \
+          -I../BlinkFramework.framework/Headers \
+          -O2 -DNDEBUG \
+          BlinkRenderingEngine.m BlinkJSEngine.m BlinkLayoutEngine.m
+        
+        # Rename object files for device
+        for file in *.o; do
+          mv "$file" "device_$file"
+        done
+        
+        # Compile for tvOS Simulator (x86_64 + ARM64)
+        echo "🖥️ Compiling for tvOS Simulator..."
+        
+        # x86_64 simulator
+        clang -c -fobjc-arc -target x86_64-apple-tvos$TVOS_DEPLOYMENT_TARGET-simulator \
+          -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) \
+          -I../BlinkFramework.framework/Headers \
+          -O2 -DNDEBUG \
+          BlinkRenderingEngine.m BlinkJSEngine.m BlinkLayoutEngine.m
+        
+        # Rename for x86_64
+        for file in *.o; do
+          if [[ ! "$file" == device_* ]]; then
+            mv "$file" "sim_x86_64_$file"
+          fi
+        done
+        
+        # ARM64 simulator
+        clang -c -fobjc-arc -target arm64-apple-tvos$TVOS_DEPLOYMENT_TARGET-simulator \
+          -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) \
+          -I../BlinkFramework.framework/Headers \
+          -O2 -DNDEBUG \
+          BlinkRenderingEngine.m BlinkJSEngine.m BlinkLayoutEngine.m
+        
+        # Rename for ARM64 simulator
+        for file in *.o; do
+          if [[ ! "$file" == device_* ]] && [[ ! "$file" == sim_x86_64_* ]]; then
+            mv "$file" "sim_arm64_$file"
+          fi
+        done
+        
+        echo "✅ Compilation completed"
+        ls -la *.o
+    
+    - name: 📦 Create Universal Framework
+      run: |
+        echo "📦 Creating universal framework binary..."
+        cd BlinkFramework_Source
+        
+        # Create separate static libraries for each architecture
+        ar rcs libBlinkFramework_device.a device_*.o
+        ar rcs libBlinkFramework_sim_x86_64.a sim_x86_64_*.o
+        ar rcs libBlinkFramework_sim_arm64.a sim_arm64_*.o
+        
+        # Create universal simulator library
+        lipo -create libBlinkFramework_sim_x86_64.a libBlinkFramework_sim_arm64.a \
+          -output libBlinkFramework_simulator.a
+        
+        # Create final universal framework binary
+        lipo -create libBlinkFramework_device.a libBlinkFramework_simulator.a \
+          -output ../BlinkFramework.framework/BlinkFramework
+        
+        cd ..
+        
+        # Verify framework binary
+        echo "🔍 Framework binary info:"
+        file BlinkFramework.framework/BlinkFramework
+        lipo -info BlinkFramework.framework/BlinkFramework
+        
+        echo "✅ Universal framework created"
+    
+    - name: ✅ Validate Framework
+      run: |
+        echo "✅ Validating Blink Framework..."
+        
+        # Check framework structure
+        echo "📁 Framework structure:"
+        find BlinkFramework.framework -type f | head -20
+        
+        # Verify binary architectures
+        echo "🏗️ Binary architectures:"
+        lipo -detailed_info BlinkFramework.framework/BlinkFramework
+        
+        # Check framework headers
+        echo "📄 Framework headers:"
+        ls -la BlinkFramework.framework/Headers/
+        
+        # Verify module map
+        if [ -f "BlinkFramework.framework/Modules/module.modulemap" ]; then
+          echo "✅ Module map exists"
+          cat BlinkFramework.framework/Modules/module.modulemap
+        else
+          echo "❌ Module map missing"
+          exit 1
+        fi
+        
+        echo "✅ Framework validation completed"
+    
+    - name: 📤 Upload Framework Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: blink-framework-${{ github.sha }}
+        path: BlinkFramework.framework/
+        retention-days: 30
+
+  # Job 2: Build and Test Application
+  build-app:
+    name: 📱 Build TV Application
+    runs-on: [self-hosted, macOS, launchfor]
+    needs: build-framework
+    timeout-minutes: 45
+    
+    strategy:
+      matrix:
+        destination:
+          - platform=tvOS Simulator,name=Apple TV,OS=17.0
+          - platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=17.0
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        lfs: true
+    
+    - name: 📦 Download Framework Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: blink-framework-${{ github.sha }}
+        path: BlinkFramework.framework/
+    
+    - name: 🔧 Setup Build Environment
+      run: |
+        echo "🔧 Setting up application build environment..."
+        
+        # Restore framework permissions
+        chmod -R 755 BlinkFramework.framework/
+        
+        # Verify project structure
+        echo "📁 Project structure:"
+        ls -la
+        
+        # Check Xcode project
+        if [ -f "$PROJECT_NAME.xcodeproj/project.pbxproj" ]; then
+          echo "✅ Xcode project found"
+        else
+          echo "❌ Xcode project missing"
+          exit 1
+        fi
+    
+    - name: 🏗️ Build Application
+      run: |
+        echo "🏗️ Building $PROJECT_NAME for ${{ matrix.destination }}..."
+        
+        BUILD_CONFIG="${{ github.event.inputs.build_type || 'debug' }}"
+        echo "Build Configuration: $BUILD_CONFIG"
+        
+        # Determine SDK and configuration
+        if [[ "${{ matrix.destination }}" == *"Simulator"* ]]; then
+          SDK="appletvsimulator"
+          CONFIG="Debug"
+        else
+          SDK="appletvos"
+          CONFIG="Release"
+        fi
+        
+        # Build the application
+        set -o pipefail
+        xcodebuild \
+          -project "$PROJECT_NAME.xcodeproj" \
+          -scheme "$PROJECT_NAME" \
+          -sdk "$SDK" \
+          -destination "${{ matrix.destination }}" \
+          -configuration "$CONFIG" \
+          -derivedDataPath "./build" \
+          -quiet \
+          build | tee build.log
+        
+        echo "✅ Build completed successfully"
+    
+    - name: 🧪 Run Unit Tests
+      if: ${{ github.event.inputs.run_tests != 'false' }}
+      run: |
+        echo "🧪 Running unit tests..."
+        
+        # Run tests if test target exists
+        if xcodebuild -project "$PROJECT_NAME.xcodeproj" -list | grep -q "Test"; then
+          set -o pipefail
+          xcodebuild test \
+            -project "$PROJECT_NAME.xcodeproj" \
+            -scheme "$PROJECT_NAME" \
+            -sdk appletvsimulator \
+            -destination "${{ matrix.destination }}" \
+            -derivedDataPath "./build" \
+            -resultBundlePath "./TestResults.xcresult" \
+            | tee test.log
+          
+          echo "✅ Tests completed"
+        else
+          echo "ℹ️ No test targets found, skipping tests"
+        fi
+    
+    - name: 📊 Generate Test Report
+      if: ${{ github.event.inputs.run_tests != 'false' && always() }}
+      run: |
+        if [ -d "TestResults.xcresult" ]; then
+          echo "📊 Generating test report..."
+          
+          # Extract test results
+          xcrun xcresulttool get --format json --path TestResults.xcresult > test_results.json
+          
+          # Generate summary
+          echo "## Test Results Summary" > test_summary.md
+          echo "- **Build**: ${{ github.sha }}" >> test_summary.md
+          echo "- **Destination**: ${{ matrix.destination }}" >> test_summary.md
+          echo "- **Date**: $(date)" >> test_summary.md
+          
+          # Add test details if available
+          if [ -f "test_results.json" ]; then
+            echo "- **Status**: $(jq -r '.issues.testFailureSummaries | length' test_results.json 2>/dev/null || echo 'Unknown')" >> test_summary.md
+          fi
+          
+          cat test_summary.md
+        fi
+    
+    - name: 📤 Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: blink-tv-app-${{ matrix.destination }}-${{ github.sha }}
+        path: |
+          build/Build/Products/
+          *.log
+          test_summary.md
+        retention-days: 30
+    
+    - name: 📤 Upload Test Results
+      if: ${{ github.event.inputs.run_tests != 'false' && always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.destination }}-${{ github.sha }}
+        path: |
+          TestResults.xcresult/
+          test_results.json
+          test_summary.md
+        retention-days: 30
+
+  # Job 3: Performance Testing
+  performance-test:
+    name: ⚡ Performance Testing
+    runs-on: [self-hosted, macOS, launchfor]
+    needs: build-app
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    timeout-minutes: 30
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 📦 Download App Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: blink-tv-app-platform=tvOS Simulator,name=Apple TV,OS=17.0-${{ github.sha }}
+        path: ./build/
+    
+    - name: ⚡ Run Performance Tests
+      run: |
+        echo "⚡ Running performance tests..."
+        
+        # Find the built app
+        APP_PATH=$(find ./build -name "*.app" -type d | head -1)
+        
+        if [ -n "$APP_PATH" ]; then
+          echo "📱 Found app at: $APP_PATH"
+          
+          # Run performance profiling
+          echo "🔍 Running performance analysis..."
+          
+          # Memory usage test
+          instruments -t "Allocations" -D memory_profile.trace "$APP_PATH" &
+          INSTRUMENTS_PID=$!
+          
+          # Let it run for 30 seconds
+          sleep 30
+          kill $INSTRUMENTS_PID 2>/dev/null || true
+          
+          # Generate performance report
+          echo "📊 Performance Test Results" > performance_report.md
+          echo "- **App**: $APP_PATH" >> performance_report.md
+          echo "- **Date**: $(date)" >> performance_report.md
+          echo "- **Commit**: ${{ github.sha }}" >> performance_report.md
+          
+          if [ -f "memory_profile.trace" ]; then
+            echo "- **Memory Profile**: Generated" >> performance_report.md
+          fi
+          
+          cat performance_report.md
+        else
+          echo "❌ No app found for performance testing"
+          exit 1
+        fi
+    
+    - name: 📤 Upload Performance Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results-${{ github.sha }}
+        path: |
+          *.trace
+          performance_report.md
+        retention-days: 30
+
+  # Job 4: Deploy to TestFlight (Manual trigger only)
+  deploy:
+    name: 🚀 Deploy to TestFlight
+    runs-on: [self-hosted, macOS, launchfor]
+    needs: [build-app, performance-test]
+    if: ${{ github.event.inputs.deploy == 'true' && github.ref == 'refs/heads/main' }}
+    timeout-minutes: 60
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 📦 Download Framework
+      uses: actions/download-artifact@v4
+      with:
+        name: blink-framework-${{ github.sha }}
+        path: BlinkFramework.framework/
+    
+    - name: 🏗️ Build for Release
+      run: |
+        echo "🏗️ Building release version for App Store..."
+        
+        # Restore framework permissions
+        chmod -R 755 BlinkFramework.framework/
+        
+        # Build for release
+        xcodebuild \
+          -project "$PROJECT_NAME.xcodeproj" \
+          -scheme "$PROJECT_NAME" \
+          -sdk appletvos \
+          -destination 'generic/platform=tvOS' \
+          -configuration Release \
+          -derivedDataPath "./build" \
+          -archivePath "./build/$PROJECT_NAME.xcarchive" \
+          archive
+        
+        echo "✅ Archive created successfully"
+    
+    - name: 📤 Export for App Store
+      env:
+        APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      run: |
+        echo "📤 Exporting for App Store Connect..."
+        
+        # Create export options plist
+        cat > ExportOptions.plist << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>app-store</string>
+    <key>destination</key>
+    <string>upload</string>
+    <key>teamID</key>
+    <string>${{ secrets.APPLE_TEAM_ID }}</string>
+</dict>
+</plist>
+EOF
+        
+        # Export archive
+        xcodebuild \
+          -exportArchive \
+          -archivePath "./build/$PROJECT_NAME.xcarchive" \
+          -exportPath "./build/export" \
+          -exportOptionsPlist ExportOptions.plist
+        
+        echo "✅ Export completed"
+    
+    - name: 🚀 Upload to TestFlight
+      env:
+        APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+      run: |
+        echo "🚀 Uploading to TestFlight..."
+        
+        # Find the IPA file
+        IPA_PATH=$(find ./build/export -name "*.ipa" | head -1)
+        
+        if [ -n "$IPA_PATH" ]; then
+          echo "📦 Found IPA: $IPA_PATH"
+          
+          # Upload using altool (or xcrun altool)
+          xcrun altool --upload-app \
+            --type tvos \
+            --file "$IPA_PATH" \
+            --apiKey "${{ secrets.APP_STORE_CONNECT_KEY_ID }}" \
+            --apiIssuer "${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}"
+          
+          echo "✅ Upload to TestFlight completed"
+        else
+          echo "❌ No IPA file found"
+          exit 1
+        fi
+
+  # Job 5: Cleanup and Notification
+  cleanup:
+    name: 🧹 Cleanup and Notify
+    runs-on: [self-hosted, macOS, launchfor]
+    needs: [build-framework, build-app]
+    if: always()
+    
+    steps:
+    - name: 🧹 Cleanup Build Artifacts
+      run: |
+        echo "🧹 Cleaning up build artifacts..."
+        
+        # Clean up build directories
+        rm -rf ~/Library/Developer/Xcode/DerivedData/$PROJECT_NAME-*
+        rm -rf ./build
+        rm -rf ./*.trace
+        rm -rf ./*.log
+        
+        # Clean up temporary files
+        find . -name "*.o" -delete
+        find . -name "*.a" -delete
+        
+        echo "✅ Cleanup completed"
+    
+    - name: 📊 Build Summary
+      run: |
+        echo "## 🎉 Blink TV Browser CI/CD Summary"
+        echo "- **Repository**: ${{ github.repository }}"
+        echo "- **Branch**: ${{ github.ref_name }}"
+        echo "- **Commit**: ${{ github.sha }}"
+        echo "- **Trigger**: ${{ github.event_name }}"
+        echo "- **Runner**: ${{ runner.name }}"
+        echo "- **Date**: $(date)"
+        echo ""
+        echo "### Jobs Status:"
+        echo "- Framework Build: ${{ needs.build-framework.result }}"
+        echo "- Application Build: ${{ needs.build-app.result }}"
+        
+        if [ "${{ github.event.inputs.deploy }}" == "true" ]; then
+          echo "- TestFlight Deploy: ${{ needs.deploy.result }}"
+        fi
+        
+        echo ""
+        echo "🚀 **Blink TV Browser build pipeline completed!**"
