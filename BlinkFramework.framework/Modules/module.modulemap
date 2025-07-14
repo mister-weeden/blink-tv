@@ -1,0 +1,11 @@
+framework module BlinkFramework {
+    umbrella header "BlinkFramework.h"
+    
+    export *
+    module * { export * }
+    
+    link "WebKit"
+    link "JavaScriptCore"
+    link "UIKit"
+    link "Foundation"
+}
